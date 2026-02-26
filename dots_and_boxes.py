@@ -4,7 +4,7 @@ Two-player game on a grid of dots. Players take turns drawing lines between
 adjacent dots. Completing the 4th side of a box scores a point and grants
 another turn. The player with the most boxes wins.
 
-The agent plays against a random opponent.
+The agent plays against a random opponent or a learned self-play policy.
 '''
 
 import gymnasium
@@ -14,7 +14,8 @@ import pufferlib
 
 
 class DotsAndBoxes(pufferlib.PufferEnv):
-    def __init__(self, rows=3, cols=3, render_mode='ansi', buf=None, seed=0):
+    def __init__(self, rows=3, cols=3, render_mode='ansi', buf=None, seed=0,
+                 opponent_policy=None):
         self.rows = rows
         self.cols = cols
         self.num_h_lines = (rows + 1) * cols      # horizontal lines
@@ -31,6 +32,8 @@ class DotsAndBoxes(pufferlib.PufferEnv):
         self.num_agents = 1
 
         super().__init__(buf)
+
+        self.opponent_policy = opponent_policy
 
         # Internal state arrays
         self.lines = np.zeros(self.num_lines, dtype=np.uint8)       # 0/1 drawn
@@ -118,12 +121,43 @@ class DotsAndBoxes(pufferlib.PufferEnv):
                 completed += 1
         return completed
 
+    def _policy_pick_move(self):
+        '''Use self.opponent_policy to pick a move with swapped perspective.'''
+        import torch
+        nl = self.num_lines
+        # Build observation from opponent's perspective (swap owner labels 1<->2)
+        obs = np.zeros(nl * 3 + self.num_boxes, dtype=np.uint8)
+        obs[:nl] = self.lines
+        obs[nl:2*nl] = 1 - self.lines  # valid mask
+        # Swap owner: 1->2, 2->1
+        swapped_line = self.line_owner.copy()
+        swapped_line[swapped_line == 1] = 99
+        swapped_line[swapped_line == 2] = 1
+        swapped_line[swapped_line == 99] = 2
+        obs[2*nl:3*nl] = swapped_line
+        swapped_box = self.box_owner.copy()
+        swapped_box[swapped_box == 1] = 99
+        swapped_box[swapped_box == 2] = 1
+        swapped_box[swapped_box == 99] = 2
+        obs[3*nl:3*nl + self.num_boxes] = swapped_box
+
+        obs_t = torch.tensor(obs, dtype=torch.float32).unsqueeze(0)
+        with torch.no_grad():
+            logits, _ = self.opponent_policy(obs_t)
+            mask = torch.tensor(self.lines, dtype=torch.bool)
+            logits[0, mask] = float('-inf')
+            action = torch.distributions.Categorical(logits=logits).sample().item()
+        return action
+
     def _opponent_turn(self):
         while True:
             valid = np.where(self.lines == 0)[0]
             if len(valid) == 0:
                 return
-            move = np.random.choice(valid)
+            if self.opponent_policy is not None:
+                move = self._policy_pick_move()
+            else:
+                move = np.random.choice(valid)
             self.lines[move] = 1
             self.line_owner[move] = 2
             boxes = self._check_boxes(move, player=2)
@@ -300,11 +334,18 @@ class RaylibRenderer:
 
         rl.EndDrawing()
 
+    def _point_to_segment_dist(self, mx, my, x1, y1, x2, y2):
+        '''Distance from point (mx, my) to line segment (x1,y1)-(x2,y2).'''
+        dx, dy = x2 - x1, y2 - y1
+        t = max(0, min(1, ((mx - x1) * dx + (my - y1) * dy) / (dx * dx + dy * dy)))
+        proj_x, proj_y = x1 + t * dx, y1 + t * dy
+        return ((mx - proj_x) ** 2 + (my - proj_y) ** 2) ** 0.5
+
     def line_from_click(self, mx, my):
         '''Return the index of the undrawn line closest to (mx, my), or -1.'''
         env = self.env
         best_idx = -1
-        best_dist = 20.0  # max click distance in pixels
+        best_dist = 30.0  # max click distance in pixels
 
         # Check horizontal lines
         for r in range(env.rows + 1):
@@ -314,8 +355,7 @@ class RaylibRenderer:
                     continue
                 x1, y1 = self._dot_pos(r, c)
                 x2, y2 = self._dot_pos(r, c + 1)
-                cx, cy = (x1 + x2) / 2, (y1 + y2) / 2
-                d = ((mx - cx) ** 2 + (my - cy) ** 2) ** 0.5
+                d = self._point_to_segment_dist(mx, my, x1, y1, x2, y2)
                 if d < best_dist:
                     best_dist = d
                     best_idx = h_idx
@@ -328,8 +368,7 @@ class RaylibRenderer:
                     continue
                 x1, y1 = self._dot_pos(r, c)
                 x2, y2 = self._dot_pos(r + 1, c)
-                cx, cy = (x1 + x2) / 2, (y1 + y2) / 2
-                d = ((mx - cx) ** 2 + (my - cy) ** 2) ** 0.5
+                d = self._point_to_segment_dist(mx, my, x1, y1, x2, y2)
                 if d < best_dist:
                     best_dist = d
                     best_idx = v_idx
@@ -398,6 +437,7 @@ def play_mode(args):
             renderer.render()
             if time.time() - game_over_time > 2.0:
                 env.reset()
+                env.terminals[0] = False
                 human_turn = True
                 game_over = False
             continue

@@ -2,6 +2,7 @@
 
 import argparse
 import time
+from datetime import datetime
 
 import numpy as np
 import torch
@@ -49,7 +50,7 @@ def parse_args():
     parser.add_argument('--cols', type=int, default=3)
     parser.add_argument('--num-envs', type=int, default=8)
     parser.add_argument('--num-steps', type=int, default=128)
-    parser.add_argument('--num-updates', type=int, default=500)
+    parser.add_argument('--num-updates', type=int, default=1000)
     parser.add_argument('--learning-rate', type=float, default=2.5e-4)
     parser.add_argument('--gamma', type=float, default=0.99)
     parser.add_argument('--gae-lambda', type=float, default=0.95)
@@ -63,6 +64,12 @@ def parse_args():
     parser.add_argument('--render-fps', type=int, default=10, help='FPS for live render')
     parser.add_argument('--checkpoint-dir', type=str, default='checkpoints')
     parser.add_argument('--save-interval', type=int, default=50, help='Save checkpoint every N updates')
+    parser.add_argument('--self-play', action=argparse.BooleanOptionalAction, default=True,
+                        help='Enable self-play training (default: on)')
+    parser.add_argument('--self-play-start', type=int, default=50,
+                        help='Train vs random for this many updates before self-play')
+    parser.add_argument('--opponent-update-interval', type=int, default=25,
+                        help='Copy weights to opponent every N updates after self-play starts')
     return parser.parse_args()
 
 
@@ -71,7 +78,10 @@ def main():
     device = torch.device(args.device)
 
     import os
-    os.makedirs(args.checkpoint_dir, exist_ok=True)
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    run_dir = os.path.join(args.checkpoint_dir, timestamp)
+    os.makedirs(run_dir, exist_ok=True)
+    print(f'Run directory: {run_dir}')
 
     # Create vectorized environments
     envs = pufferlib.vector.make(
@@ -114,9 +124,16 @@ def main():
     start_time = time.time()
     episode_returns = []
 
+    # Self-play opponent (shared across all envs)
+    import copy
+    opponent_policy = None
+
     print(f'Training Dots and Boxes ({args.rows}x{args.cols} boxes)')
     print(f'Obs size: {obs_size}, Action size: {act_size}')
     print(f'Num envs: {args.num_envs}, Batch size: {batch_size}')
+    if args.self_play:
+        print(f'Self-play: on (starts at update {args.self_play_start}, '
+              f'opponent updates every {args.opponent_update_interval})')
     print()
 
     for update in range(1, args.num_updates + 1):
@@ -210,9 +227,22 @@ def main():
                 nn.utils.clip_grad_norm_(policy.parameters(), args.max_grad_norm)
                 optimizer.step()
 
+        # Self-play: activate or update opponent
+        if args.self_play:
+            if update == args.self_play_start:
+                opponent_policy = copy.deepcopy(policy).eval()
+                for env in envs.envs:
+                    env.opponent_policy = opponent_policy
+                print(f'[Self-play] Activated at update {update}')
+            elif (opponent_policy is not None
+                  and update > args.self_play_start
+                  and (update - args.self_play_start) % args.opponent_update_interval == 0):
+                opponent_policy.load_state_dict(policy.state_dict())
+                print(f'[Self-play] Opponent updated at update {update}')
+
         # Save checkpoint
         if update % args.save_interval == 0 or update == args.num_updates:
-            path = f'{args.checkpoint_dir}/dots_and_boxes_{update}.pt'
+            path = f'{run_dir}/dots_and_boxes_{update}.pt'
             torch.save(policy.state_dict(), path)
 
         # Live render: play a few steps with current policy in the render env
@@ -248,7 +278,7 @@ def main():
         renderer.close()
 
     # Save final checkpoint
-    final_path = f'{args.checkpoint_dir}/dots_and_boxes_final.pt'
+    final_path = f'{run_dir}/dots_and_boxes_final.pt'
     torch.save(policy.state_dict(), final_path)
     print(f'\nCheckpoint saved to {final_path}')
 
