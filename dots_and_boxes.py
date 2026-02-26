@@ -230,7 +230,9 @@ class RaylibRenderer:
         rl.ClearBackground([30, 30, 40, 255])
 
         # Draw score header
-        score_text = f"Agent: {env.agent_score}   Opponent: {env.opp_score}".encode()
+        p1 = self.player1_name if hasattr(self, 'player1_name') else 'Agent'
+        p2 = self.player2_name if hasattr(self, 'player2_name') else 'Opponent'
+        score_text = f"{p1}: {env.agent_score}   {p2}: {env.opp_score}".encode()
         rl.DrawText(score_text, 20, 15, 24, [255, 255, 255, 255])
 
         # Draw filled boxes
@@ -280,17 +282,59 @@ class RaylibRenderer:
                 x, y = self._dot_pos(r, c)
                 rl.DrawCircleV([x, y], 6.0, [255, 255, 255, 255])
 
+        # Turn indicator (for play mode)
+        if hasattr(self, 'turn_text') and self.turn_text and not env.terminals[0]:
+            text_w = rl.MeasureText(self.turn_text.encode(), 20)
+            rl.DrawText(self.turn_text.encode(),
+                        self.width - text_w - 20, 18, 20, [200, 200, 200, 255])
+
         # Game over flash
         if env.terminals[0]:
             if env.agent_score > env.opp_score:
-                msg = b"Agent Wins!"
+                msg = f"{p1} Wins!".encode()
             elif env.agent_score < env.opp_score:
-                msg = b"Opponent Wins!"
+                msg = f"{p2} Wins!".encode()
             else:
                 msg = b"Draw!"
             rl.DrawText(msg, self.width // 2 - 80, self.height // 2, 30, [255, 255, 0, 255])
 
         rl.EndDrawing()
+
+    def line_from_click(self, mx, my):
+        '''Return the index of the undrawn line closest to (mx, my), or -1.'''
+        env = self.env
+        best_idx = -1
+        best_dist = 20.0  # max click distance in pixels
+
+        # Check horizontal lines
+        for r in range(env.rows + 1):
+            for c in range(env.cols):
+                h_idx = r * env.cols + c
+                if env.lines[h_idx]:
+                    continue
+                x1, y1 = self._dot_pos(r, c)
+                x2, y2 = self._dot_pos(r, c + 1)
+                cx, cy = (x1 + x2) / 2, (y1 + y2) / 2
+                d = ((mx - cx) ** 2 + (my - cy) ** 2) ** 0.5
+                if d < best_dist:
+                    best_dist = d
+                    best_idx = h_idx
+
+        # Check vertical lines
+        for r in range(env.rows):
+            for c in range(env.cols + 1):
+                v_idx = env.num_h_lines + r * (env.cols + 1) + c
+                if env.lines[v_idx]:
+                    continue
+                x1, y1 = self._dot_pos(r, c)
+                x2, y2 = self._dot_pos(r + 1, c)
+                cx, cy = (x1 + x2) / 2, (y1 + y2) / 2
+                d = ((mx - cx) ** 2 + (my - cy) ** 2) ** 0.5
+                if d < best_dist:
+                    best_dist = d
+                    best_idx = v_idx
+
+        return best_idx
 
     def should_close(self):
         return self.rl.WindowShouldClose()
@@ -299,12 +343,115 @@ class RaylibRenderer:
         self.rl.CloseWindow()
 
 
+def _load_policy(checkpoint, env):
+    '''Load a trained policy from a checkpoint file.'''
+    import torch
+    from main import Policy
+    obs_size = env.single_observation_space.shape[0]
+    act_size = env.single_action_space.n
+    policy = Policy(obs_size, act_size)
+    policy.load_state_dict(torch.load(checkpoint, weights_only=True))
+    policy.eval()
+    print(f'Loaded checkpoint: {checkpoint}')
+    return policy
+
+
+def _ai_pick_action(policy, env):
+    '''Use the trained policy to pick a line index.'''
+    import torch
+    env._update_obs()
+    obs_t = torch.tensor(env.observations, dtype=torch.float32)
+    with torch.no_grad():
+        logits, _ = policy(obs_t)
+        # Mask invalid actions (already drawn lines)
+        mask = torch.tensor(env.lines, dtype=torch.bool)
+        logits[0, mask] = float('-inf')
+        action = torch.distributions.Categorical(logits=logits).sample().item()
+    return action
+
+
+def play_mode(args):
+    '''Human vs AI interactive play mode.'''
+    import time
+
+    if args.checkpoint is None:
+        print('Error: --checkpoint is required for --play mode')
+        return
+
+    env = DotsAndBoxes(rows=args.rows, cols=args.cols, render_mode='human')
+    env.reset()
+    renderer = RaylibRenderer(env, fps=60)
+    renderer.player1_name = 'You'
+    renderer.player2_name = 'AI'
+    policy = _load_policy(args.checkpoint, env)
+    rl = renderer.rl
+
+    human_turn = True
+    game_over = False
+    game_over_time = 0
+
+    print('Click on a line to draw it. You are Blue, AI is Red.')
+
+    while not renderer.should_close():
+        # After game over, pause then reset
+        if game_over:
+            renderer.render()
+            if time.time() - game_over_time > 2.0:
+                env.reset()
+                human_turn = True
+                game_over = False
+            continue
+
+        renderer.turn_text = 'Your turn' if human_turn else 'AI thinking...'
+
+        if human_turn:
+            # Wait for mouse click
+            if rl.IsMouseButtonPressed(0):
+                mx, my = rl.GetMouseX(), rl.GetMouseY()
+                line_idx = renderer.line_from_click(mx, my)
+                if line_idx >= 0:
+                    env.lines[line_idx] = 1
+                    env.line_owner[line_idx] = 1
+                    boxes = env._check_boxes(line_idx, player=1)
+
+                    if env._game_over():
+                        env.terminals[0] = True
+                        game_over = True
+                        game_over_time = time.time()
+                    elif boxes == 0:
+                        human_turn = False
+                    # else: extra turn for human
+                    env._update_obs()
+        else:
+            # AI turn loop: AI keeps going while it completes boxes
+            action = _ai_pick_action(policy, env)
+            env.lines[action] = 1
+            env.line_owner[action] = 2
+            boxes = env._check_boxes(action, player=2)
+            env._update_obs()
+            renderer.render()
+
+            if env._game_over():
+                env.terminals[0] = True
+                game_over = True
+                game_over_time = time.time()
+            elif boxes == 0:
+                human_turn = True
+            # else: AI gets another turn (will loop next frame)
+
+        renderer.render()
+
+    renderer.close()
+
+
 if __name__ == '__main__':
     import argparse
     import time
 
     parser = argparse.ArgumentParser()
     parser.add_argument('--benchmark', action='store_true', help='Run SPS benchmark')
+    parser.add_argument('--play', action='store_true',
+                        help='Play against the trained AI (requires --checkpoint)')
     parser.add_argument('--checkpoint', type=str, default=None,
                         help='Path to trained policy checkpoint (.pt)')
     parser.add_argument('--fps', type=int, default=3, help='Render FPS')
@@ -323,6 +470,8 @@ if __name__ == '__main__':
             obs, rewards, terminals, truncations, info = env.step(actions[steps % CACHE])
             steps += 1
         print(f'DotsAndBoxes SPS: {int(steps / (time.time() - start))}')
+    elif args.play:
+        play_mode(args)
     else:
         env = DotsAndBoxes(rows=args.rows, cols=args.cols, render_mode='human')
         env.reset()
@@ -331,14 +480,7 @@ if __name__ == '__main__':
         # Load trained policy if checkpoint provided
         policy = None
         if args.checkpoint:
-            import torch
-            from main import Policy
-            obs_size = env.single_observation_space.shape[0]
-            act_size = env.single_action_space.n
-            policy = Policy(obs_size, act_size)
-            policy.load_state_dict(torch.load(args.checkpoint, weights_only=True))
-            policy.eval()
-            print(f'Loaded checkpoint: {args.checkpoint}')
+            policy = _load_policy(args.checkpoint, env)
 
         while not renderer.should_close():
             if policy is not None:

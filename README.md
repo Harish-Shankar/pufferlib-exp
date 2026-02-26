@@ -35,6 +35,14 @@ Training options:
 | `--save-interval` | 50 | Checkpoint frequency (updates) |
 | `--checkpoint-dir` | `checkpoints/` | Where to save models |
 
+### Play against the AI
+
+```bash
+uv run dots_and_boxes.py --play --checkpoint checkpoints/dots_and_boxes_200.pt
+```
+
+Click on lines to draw them. You are blue, the AI is red. Completing a box gives an extra turn. The game resets automatically after each match.
+
 ### Watch a trained agent play
 
 ```bash
